@@ -304,7 +304,15 @@ fn print_timers(timers: &Timers) {
 
 fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>, line: &mut usize) {
     while let Some(c) = chars.peek() {
-        if *c == '\n' {
+        if *c == '#' {
+            // Skip until end of line
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    *line += 1;
+                    break;
+                }
+            }
+        } else if *c == '\n' {
             *line += 1;
             chars.next();
         } else if c.is_whitespace() {
