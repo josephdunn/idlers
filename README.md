@@ -8,6 +8,7 @@ Inspired by [Hypridle](https://github.com/hyprwm/hypridle) and supports a subset
 
 - Run commands after configurable idle timeouts
 - Run commands when the user resumes activity
+- Idle inhibitor awareness (e.g. don't lock screen during a Discord voice call)
 - Hot-reload config file on changes
 - Log to stderr and/or a file
 - Survives terminal detachment (safe to run with `&`)
@@ -43,9 +44,32 @@ listener {
 }
 ```
 
+### Idle inhibition
+
+By default, idlers ignores idle inhibitors — timers will fire even if an application (e.g. Discord during a voice call) is requesting that idle be inhibited. This requires compositor support for version 2 of the `ext-idle-notify-v1` protocol.
+
+To make a listener respect idle inhibitors, add `allow-inhibit = true`:
+
+```
+listener {
+    timeout = 30
+    on-timeout = hyprctl dispatch dpms off
+    on-resume = hyprctl dispatch dpms on
+    allow-inhibit = true
+}
+```
+
+This listener will not fire while an application is inhibiting idle.
+
 ### Hypridle compatibility
 
-*idlers* can be used with an existing hypridle.conf. It adds an optional `name` parameter for `listener` blocks and does not support Hypridle's `ignore_inhibit` option. Additionally, it does not support Hypridle's `general` block, but will silently ignore it.
+*idlers* can be used with an existing hypridle.conf. It adds an optional `name` parameter for `listener` blocks and supports Hypridle's `ignore_inhibit` option. Non-`listener` sections (e.g. Hypridle's `general` block) are silently ignored.
+
+**Note:** idlers and Hypridle have opposite defaults for idle inhibition. Hypridle respects inhibitors by default and uses `ignore_inhibit = true` to override. idlers ignores inhibitors by default and uses `allow-inhibit = true` to respect them.
+
+When `ignore_inhibit` is found anywhere in the config, idlers automatically enters **hypridle-compatible mode**: all listeners default to respecting inhibitors, and `ignore_inhibit = true` overrides this per-listener. A notice is logged when this happens.
+
+Mixing `allow-inhibit` and `ignore_inhibit` in the same config is not allowed and will produce an error.
 
 ### Listener fields
 
@@ -55,6 +79,8 @@ listener {
 | `timeout` | Yes | Seconds of idle time before `on-timeout` runs |
 | `on-timeout` | No | Shell command to run when the timeout fires |
 | `on-resume` | No | Shell command to run when the user becomes active (only if the timeout had fired) |
+| `allow-inhibit` | No | If `true`, respect idle inhibitors (default: `false`) |
+| `ignore_inhibit` | No | Hypridle-compatible alternative to `allow-inhibit` (see above) |
 
 Non-`listener` sections in the config file are ignored.
 

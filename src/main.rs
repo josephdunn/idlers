@@ -34,24 +34,40 @@ struct Args {
     log_file: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum IdleSource {
+    Input,
+    Inhibit,
+}
+
 struct Timer {
     name: String,
     duration_secs: u64,
     on_timeout: String,
     on_resume: String,
+    allow_inhibit: bool,
     started: Instant,
     fired: bool,
+    active: bool,
 }
 
 impl Timer {
-    fn new(name: &str, duration_secs: u64, on_timeout: &str, on_resume: &str) -> Self {
+    fn new(
+        name: &str,
+        duration_secs: u64,
+        on_timeout: &str,
+        on_resume: &str,
+        allow_inhibit: bool,
+    ) -> Self {
         Self {
             name: name.to_string(),
             duration_secs,
             on_timeout: on_timeout.to_string(),
             on_resume: on_resume.to_string(),
+            allow_inhibit,
             started: Instant::now(),
             fired: false,
+            active: false,
         }
     }
 
@@ -82,20 +98,49 @@ impl Timers {
         Self { timers: Vec::new() }
     }
 
-    fn add(&mut self, name: &str, duration_secs: u64, on_timeout: &str, on_resume: &str) {
-        self.timers
-            .push(Timer::new(name, duration_secs, on_timeout, on_resume));
+    fn add(
+        &mut self,
+        name: &str,
+        duration_secs: u64,
+        on_timeout: &str,
+        on_resume: &str,
+        allow_inhibit: bool,
+    ) {
+        self.timers.push(Timer::new(
+            name,
+            duration_secs,
+            on_timeout,
+            on_resume,
+            allow_inhibit,
+        ));
     }
 
-    fn reset_all(&mut self) {
+    fn update_idle_state(&mut self, input_idle: bool, inhibit_idle: bool) {
         for timer in &mut self.timers {
-            timer.reset();
+            let should_be_active = if timer.allow_inhibit {
+                input_idle && inhibit_idle
+            } else {
+                input_idle
+            };
+
+            if !timer.active && should_be_active {
+                // Becoming active: reset and start counting
+                timer.reset();
+                timer.active = true;
+            } else if timer.active && !should_be_active {
+                // Becoming inactive: fire on_resume if timer had fired
+                if timer.fired {
+                    info!(timer = timer.name, "timer resuming");
+                    spawn_shell(&timer.on_resume);
+                }
+                timer.active = false;
+            }
         }
     }
 
     fn fire_expired(&mut self) {
         for timer in &mut self.timers {
-            if timer.is_expired() && !timer.fired {
+            if timer.active && timer.is_expired() && !timer.fired {
                 timer.fired = true;
                 info!(
                     timer = timer.name,
@@ -107,49 +152,74 @@ impl Timers {
         }
     }
 
-    fn resume_fired(&mut self) {
-        for timer in &mut self.timers {
-            if timer.fired {
-                info!(timer = timer.name, "timer resuming");
-                spawn_shell(&timer.on_resume);
-            }
-        }
+    fn any_active(&self) -> bool {
+        self.timers.iter().any(|t| t.active)
     }
 
-    /// Seconds until the next unfired timer expires, or `None` if all have fired.
+    /// Seconds until the next unfired active timer expires, or `None` if none.
     fn next_deadline_secs(&self) -> Option<u64> {
         self.timers
             .iter()
-            .filter(|t| !t.fired)
+            .filter(|t| t.active && !t.fired)
             .map(|t| t.remaining_secs())
             .min()
     }
 }
 
 struct State {
-    idle: bool,
+    input_idle: bool,
+    inhibit_idle: bool,
+    has_v2: bool,
     timers: Timers,
 }
 
-impl Dispatch<ExtIdleNotificationV1, ()> for State {
+impl State {
+    fn update_timers(&mut self) {
+        self.timers.update_idle_state(self.input_idle, self.inhibit_idle);
+    }
+}
+
+impl Dispatch<ExtIdleNotificationV1, IdleSource> for State {
     fn event(
         state: &mut Self,
         _proxy: &ExtIdleNotificationV1,
         event: ext_idle_notification_v1::Event,
-        _data: &(),
+        data: &IdleSource,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         match event {
             ext_idle_notification_v1::Event::Idled => {
-                state.idle = true;
-                state.timers.reset_all();
-                debug!("user is idle");
+                match data {
+                    IdleSource::Input => {
+                        state.input_idle = true;
+                        debug!("user is idle (input)");
+                    }
+                    IdleSource::Inhibit => {
+                        state.inhibit_idle = true;
+                        if !state.has_v2 {
+                            state.input_idle = true;
+                        }
+                        debug!("user is idle (inhibit-aware)");
+                    }
+                }
+                state.update_timers();
             }
             ext_idle_notification_v1::Event::Resumed => {
-                state.idle = false;
-                state.timers.resume_fired();
-                debug!("user is active");
+                match data {
+                    IdleSource::Input => {
+                        state.input_idle = false;
+                        debug!("user is active (input)");
+                    }
+                    IdleSource::Inhibit => {
+                        state.inhibit_idle = false;
+                        if !state.has_v2 {
+                            state.input_idle = false;
+                        }
+                        debug!("user is active (inhibit-aware)");
+                    }
+                }
+                state.update_timers();
             }
             _ => {}
         }
@@ -185,6 +255,10 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
     let mut timers = Timers::new();
     let mut idx = 0;
     let mut line = 1usize;
+    let mut has_allow_inhibit = false;
+    let mut has_ignore_inhibit = false;
+    let mut allow_inhibit_flags: Vec<Option<bool>> = Vec::new();
+    let mut ignore_inhibit_flags: Vec<Option<bool>> = Vec::new();
 
     let mut chars = content.chars().peekable();
     while chars.peek().is_some() {
@@ -225,6 +299,8 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
         let mut timeout: Option<u64> = None;
         let mut on_timeout = String::new();
         let mut on_resume = String::new();
+        let mut allow_inhibit: Option<bool> = None;
+        let mut ignore_inhibit: Option<bool> = None;
 
         // Parse key = value lines until '}'
         loop {
@@ -267,6 +343,28 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
                 }
                 "on-timeout" => on_timeout = value,
                 "on-resume" => on_resume = value,
+                "allow-inhibit" => {
+                    allow_inhibit = Some(match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(format!(
+                                "line {line}: invalid allow-inhibit value: '{value}' (expected true or false)"
+                            ));
+                        }
+                    });
+                }
+                "ignore_inhibit" => {
+                    ignore_inhibit = Some(match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(format!(
+                                "line {line}: invalid ignore_inhibit value: '{value}' (expected true or false)"
+                            ));
+                        }
+                    });
+                }
                 other => {
                     return Err(format!(
                         "line {line}: unknown key '{other}' in listener block"
@@ -277,12 +375,46 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
 
         let secs = timeout.ok_or(format!("line {line}: listener block missing 'timeout'"))?;
         let name = name.unwrap_or_else(|| format!("listener-{idx}"));
-        timers.add(&name, secs, &on_timeout, &on_resume);
+        // Store raw flags; we resolve the default after parsing all blocks
+        timers.add(&name, secs, &on_timeout, &on_resume, allow_inhibit.unwrap_or(false));
+        // Track per-block flags for cross-block validation
+        if let Some(v) = allow_inhibit {
+            if v {
+                has_allow_inhibit = true;
+            }
+        }
+        if let Some(v) = ignore_inhibit {
+            has_ignore_inhibit = true;
+            ignore_inhibit_flags.push(Some(v));
+        } else {
+            ignore_inhibit_flags.push(None);
+        }
+        allow_inhibit_flags.push(allow_inhibit);
         idx += 1;
     }
 
     if timers.timers.is_empty() {
         return Err(format!("No listeners defined in {}", path.display()));
+    }
+
+    // Validate: allow-inhibit and ignore_inhibit cannot coexist
+    if has_allow_inhibit && has_ignore_inhibit {
+        return Err(
+            "conflicting config: allow-inhibit and ignore_inhibit cannot both be used".to_string(),
+        );
+    }
+
+    // Hypridle compat: if ignore_inhibit appears anywhere, default to allowing inhibition
+    if has_ignore_inhibit {
+        info!("hypridle-compatible mode: ignore_inhibit found in config, defaulting to allow-inhibit=true");
+
+        for (i, timer) in timers.timers.iter_mut().enumerate() {
+            if let Some(true) = ignore_inhibit_flags[i] {
+                timer.allow_inhibit = false;
+            } else if allow_inhibit_flags[i].is_none() {
+                timer.allow_inhibit = true;
+            }
+        }
     }
 
     Ok(timers)
@@ -297,6 +429,9 @@ fn print_timers(timers: &Timers) {
         }
         if !t.on_resume.is_empty() {
             desc.push_str(&format!(" on-resume=\"{}\"", t.on_resume));
+        }
+        if t.allow_inhibit {
+            desc.push_str(" allow-inhibit");
         }
         info!("{desc}");
     }
@@ -438,27 +573,41 @@ fn main() {
     // Detect idle after 1 second of inactivity; listener timeouts count from there
     let idle_timeout_ms: u32 = 1_000;
 
-    let mut state = State {
-        idle: false,
-        timers,
-    };
-
     let seat: wl_seat::WlSeat = globals
         .bind::<wl_seat::WlSeat, _, _>(&qh, 1..=9, ())
         .expect("No seat found");
 
-    // Try v2 first (ignores idle inhibitors), fall back to v1
+    // Try v2 first (supports input-only idle detection), fall back to v1
     let idle_notifier: ExtIdleNotifierV1 = globals
         .bind::<ExtIdleNotifierV1, _, _>(&qh, 2..=2, ())
         .or_else(|_| globals.bind::<ExtIdleNotifierV1, _, _>(&qh, 1..=1, ()))
         .expect("Compositor does not support ext-idle-notify-v1");
 
-    let _notification = if idle_notifier.version() >= 2 {
+    let has_v2 = idle_notifier.version() >= 2;
+
+    // Input-based notification (ignores inhibitors) — only available with v2
+    let _input_notification = if has_v2 {
         info!("using input-based idle detection (ignores idle inhibitors)");
-        idle_notifier.get_input_idle_notification(idle_timeout_ms, &seat, &qh, ())
+        Some(idle_notifier.get_input_idle_notification(
+            idle_timeout_ms,
+            &seat,
+            &qh,
+            IdleSource::Input,
+        ))
     } else {
-        info!("using standard idle detection (respects idle inhibitors)");
-        idle_notifier.get_idle_notification(idle_timeout_ms, &seat, &qh, ())
+        info!("v2 not available; allow-inhibit has no effect");
+        None
+    };
+
+    // Inhibit-aware notification (respects inhibitors) — always created
+    let _inhibit_notification =
+        idle_notifier.get_idle_notification(idle_timeout_ms, &seat, &qh, IdleSource::Inhibit);
+
+    let mut state = State {
+        input_idle: false,
+        inhibit_idle: false,
+        has_v2,
+        timers,
     };
 
     // Watch config file for changes
@@ -484,7 +633,7 @@ fn main() {
         if let Some(guard) = event_queue.prepare_read() {
             // Compute poll timeout: shortest of timer deadline (if idle) and
             // pending reload debounce
-            let timer_deadline = if state.idle {
+            let timer_deadline = if state.timers.any_active() {
                 state.timers.next_deadline_secs()
             } else {
                 None
@@ -533,6 +682,7 @@ fn main() {
                     Ok(new_timers) => {
                         print_timers(&new_timers);
                         state.timers = new_timers;
+                        state.update_timers();
                     }
                     Err(e) => {
                         error!("config reload failed, keeping current config: {e}");
@@ -544,7 +694,7 @@ fn main() {
         // Dispatch all pending events
         event_queue.dispatch_pending(&mut state).unwrap();
 
-        if state.idle {
+        if state.timers.any_active() {
             state.timers.fire_expired();
         }
     }
