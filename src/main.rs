@@ -347,7 +347,10 @@ fn spawn_shell(cmd: &str) {
                     info!(cmd = %cmd, "stderr: {line}");
                 }
                 if !output.status.success() {
-                    let code = output.status.code().map_or("signal".to_string(), |c| c.to_string());
+                    let code = output
+                        .status
+                        .code()
+                        .map_or("signal".to_string(), |c| c.to_string());
                     error!(cmd = %cmd, code = %code, "command failed");
                 }
             }
@@ -451,18 +454,14 @@ fn main() {
     let _notification = idle_notifier.get_idle_notification(idle_timeout_ms, &seat, &qh, ());
 
     // Watch config file for changes
-    // Watch the config directory so we catch atomic save (rename/move) by editors
     let inotify_fd =
         inotify::init(inotify::CreateFlags::NONBLOCK).expect("Failed to create inotify");
     inotify::add_watch(
         &inotify_fd,
-        conf.parent().unwrap(),
-        inotify::WatchFlags::CLOSE_WRITE
-            | inotify::WatchFlags::MODIFY
-            | inotify::WatchFlags::CREATE
-            | inotify::WatchFlags::MOVED_TO,
+        &conf,
+        inotify::WatchFlags::CLOSE_WRITE | inotify::WatchFlags::MODIFY,
     )
-    .expect("Failed to watch config directory");
+    .expect("Failed to watch config file");
 
     let mut last_change = Instant::now();
     let mut pending_reload = false;
