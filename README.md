@@ -44,6 +44,8 @@ listener {
 }
 ```
 
+An arbitrary number of listeners is supported.
+
 ### Idle inhibition
 
 By default, idlers ignores idle inhibitors — timers will fire even if an application (e.g. Discord during a voice call) is requesting that idle be inhibited. This requires compositor support for version 2 of the `ext-idle-notify-v1` protocol.
