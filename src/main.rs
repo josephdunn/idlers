@@ -610,15 +610,23 @@ fn main() {
         timers,
     };
 
-    // Watch config file for changes
+    // Watch config directory for changes (not the file directly, since editors
+    // like Neovim do atomic saves that replace the inode)
+    let config_filename = conf
+        .file_name()
+        .expect("Config path has no filename")
+        .to_os_string();
     let inotify_fd =
         inotify::init(inotify::CreateFlags::NONBLOCK).expect("Failed to create inotify");
     inotify::add_watch(
         &inotify_fd,
-        &conf,
-        inotify::WatchFlags::CLOSE_WRITE | inotify::WatchFlags::MODIFY,
+        conf.parent().unwrap(),
+        inotify::WatchFlags::CLOSE_WRITE
+            | inotify::WatchFlags::MODIFY
+            | inotify::WatchFlags::CREATE
+            | inotify::WatchFlags::MOVED_TO,
     )
-    .expect("Failed to watch config file");
+    .expect("Failed to watch config directory");
 
     let mut last_change = Instant::now();
     let mut pending_reload = false;
@@ -668,11 +676,22 @@ fn main() {
 
             // Check for config file changes (debounce: 1 second after last change)
             if config_changed {
-                // Drain inotify events
-                let mut buf = [0u8; 4096];
-                while rustix::io::read(&inotify_fd, &mut buf).unwrap_or(0) > 0 {}
-                pending_reload = true;
-                last_change = Instant::now();
+                // Drain inotify events, only flag reload if our config file was affected
+                let mut buf = [std::mem::MaybeUninit::uninit(); 4096];
+                let mut reader = inotify::Reader::new(&inotify_fd, &mut buf);
+                loop {
+                    match reader.next() {
+                        Ok(event) => {
+                            if let Some(name) = event.file_name() {
+                                if name.to_bytes() == config_filename.as_encoded_bytes() {
+                                    pending_reload = true;
+                                    last_change = Instant::now();
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
 
             if pending_reload && last_change.elapsed().as_secs() >= 1 {
