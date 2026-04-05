@@ -347,7 +347,8 @@ fn spawn_shell(cmd: &str) {
                     info!(cmd = %cmd, "stderr: {line}");
                 }
                 if !output.status.success() {
-                    error!(cmd = %cmd, code = ?output.status.code(), "command failed");
+                    let code = output.status.code().map_or("signal".to_string(), |c| c.to_string());
+                    error!(cmd = %cmd, code = %code, "command failed");
                 }
             }
             Err(e) => {
