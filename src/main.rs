@@ -9,7 +9,7 @@ use rustix::fs::inotify;
 use tracing::{debug, error, info};
 use tracing_subscriber::prelude::*;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
@@ -447,11 +447,19 @@ fn main() {
         .bind::<wl_seat::WlSeat, _, _>(&qh, 1..=9, ())
         .expect("No seat found");
 
+    // Try v2 first (ignores idle inhibitors), fall back to v1
     let idle_notifier: ExtIdleNotifierV1 = globals
-        .bind::<ExtIdleNotifierV1, _, _>(&qh, 1..=1, ())
+        .bind::<ExtIdleNotifierV1, _, _>(&qh, 2..=2, ())
+        .or_else(|_| globals.bind::<ExtIdleNotifierV1, _, _>(&qh, 1..=1, ()))
         .expect("Compositor does not support ext-idle-notify-v1");
 
-    let _notification = idle_notifier.get_idle_notification(idle_timeout_ms, &seat, &qh, ());
+    let _notification = if idle_notifier.version() >= 2 {
+        info!("using input-based idle detection (ignores idle inhibitors)");
+        idle_notifier.get_input_idle_notification(idle_timeout_ms, &seat, &qh, ())
+    } else {
+        info!("using standard idle detection (respects idle inhibitors)");
+        idle_notifier.get_idle_notification(idle_timeout_ms, &seat, &qh, ())
+    };
 
     // Watch config file for changes
     let inotify_fd =
