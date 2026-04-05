@@ -111,6 +111,7 @@ idlers [OPTIONS]
 | `-l`, `--log-level <LEVEL>` | Log level: error, warn, info, debug, trace (default: info) |
 | `-c`, `--config <PATH>` | Path to config file |
 | `--log-file <PATH>` | Log to a file (in addition to stderr) |
+| `--no-reload` | Disable hot-reloading of the config file |
 
 ### Examples
 

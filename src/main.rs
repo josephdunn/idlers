@@ -32,6 +32,10 @@ struct Args {
     /// Log to a file (in addition to stderr)
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Disable hot-reloading of the config file
+    #[arg(long)]
+    no_reload: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -612,21 +616,26 @@ fn main() {
 
     // Watch config directory for changes (not the file directly, since editors
     // like Neovim do atomic saves that replace the inode)
-    let config_filename = conf
-        .file_name()
-        .expect("Config path has no filename")
-        .to_os_string();
-    let inotify_fd =
-        inotify::init(inotify::CreateFlags::NONBLOCK).expect("Failed to create inotify");
-    inotify::add_watch(
-        &inotify_fd,
-        conf.parent().unwrap(),
-        inotify::WatchFlags::CLOSE_WRITE
-            | inotify::WatchFlags::MODIFY
-            | inotify::WatchFlags::CREATE
-            | inotify::WatchFlags::MOVED_TO,
-    )
-    .expect("Failed to watch config directory");
+    let inotify_fd = if !args.no_reload {
+        let config_filename_owned = conf
+            .file_name()
+            .expect("Config path has no filename")
+            .to_os_string();
+        let fd =
+            inotify::init(inotify::CreateFlags::NONBLOCK).expect("Failed to create inotify");
+        inotify::add_watch(
+            &fd,
+            conf.parent().unwrap(),
+            inotify::WatchFlags::CLOSE_WRITE
+                | inotify::WatchFlags::MODIFY
+                | inotify::WatchFlags::CREATE
+                | inotify::WatchFlags::MOVED_TO,
+        )
+        .expect("Failed to watch config directory");
+        Some((fd, config_filename_owned))
+    } else {
+        None
+    };
 
     let mut last_change = Instant::now();
     let mut pending_reload = false;
@@ -663,35 +672,41 @@ fn main() {
                 });
 
             let wayland_fd = guard.connection_fd();
-            let mut fds = [
-                PollFd::new(&wayland_fd, PollFlags::IN),
-                PollFd::new(&inotify_fd, PollFlags::IN),
-            ];
-            poll(&mut fds, timeout.as_ref()).unwrap();
 
-            let config_changed = fds[1].revents().contains(PollFlags::IN);
+            if let Some((ref inotify, ref config_filename)) = inotify_fd {
+                let mut fds = [
+                    PollFd::new(&wayland_fd, PollFlags::IN),
+                    PollFd::new(inotify, PollFlags::IN),
+                ];
+                poll(&mut fds, timeout.as_ref()).unwrap();
 
-            // Read any available wayland events (ok to ignore WouldBlock)
-            let _ = guard.read();
+                let config_changed = fds[1].revents().contains(PollFlags::IN);
 
-            // Check for config file changes (debounce: 1 second after last change)
-            if config_changed {
-                // Drain inotify events, only flag reload if our config file was affected
-                let mut buf = [std::mem::MaybeUninit::uninit(); 4096];
-                let mut reader = inotify::Reader::new(&inotify_fd, &mut buf);
-                loop {
-                    match reader.next() {
-                        Ok(event) => {
-                            if let Some(name) = event.file_name() {
-                                if name.to_bytes() == config_filename.as_encoded_bytes() {
-                                    pending_reload = true;
-                                    last_change = Instant::now();
+                // Read any available wayland events (ok to ignore WouldBlock)
+                let _ = guard.read();
+
+                // Check for config file changes (debounce: 1 second after last change)
+                if config_changed {
+                    let mut buf = [std::mem::MaybeUninit::uninit(); 4096];
+                    let mut reader = inotify::Reader::new(inotify, &mut buf);
+                    loop {
+                        match reader.next() {
+                            Ok(event) => {
+                                if let Some(name) = event.file_name() {
+                                    if name.to_bytes() == config_filename.as_encoded_bytes() {
+                                        pending_reload = true;
+                                        last_change = Instant::now();
+                                    }
                                 }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
                 }
+            } else {
+                let mut fds = [PollFd::new(&wayland_fd, PollFlags::IN)];
+                poll(&mut fds, timeout.as_ref()).unwrap();
+                let _ = guard.read();
             }
 
             if pending_reload && last_change.elapsed().as_secs() >= 1 {
