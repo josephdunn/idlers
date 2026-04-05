@@ -63,6 +63,18 @@ listener {
 
 This listener will not fire while an application is inhibiting idle.
 
+To see if anything is inhibiting idle, on Hyprland run:
+
+```
+hyprctl clients | awk '/^Window.*->/{name=$0} /inhibitingIdle: 1/{print name}'
+```
+
+On Sway, run:
+
+```
+swaymsg -r -t get_tree | jq -r '.. | objects | select(.inhibit_idle == true) | .name'
+```
+
 ### Hypridle compatibility
 
 *idlers* can be used with an existing hypridle.conf. It adds an optional `name` parameter for `listener` blocks and supports Hypridle's `ignore_inhibit` option. Non-`listener` sections (e.g. Hypridle's `general` block) are silently ignored.
