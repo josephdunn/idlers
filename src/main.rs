@@ -536,7 +536,11 @@ fn main() {
 
     let args = Args::parse();
 
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(SafeStderr);
+    let timer = tracing_subscriber::fmt::time::LocalTime::rfc_3339();
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(SafeStderr)
+        .with_timer(timer.clone());
 
     let file_layer = args.log_file.map(|path| {
         let file = fs::OpenOptions::new()
@@ -550,6 +554,7 @@ fn main() {
         tracing_subscriber::fmt::layer()
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
+            .with_timer(timer.clone())
     });
 
     tracing_subscriber::registry()
