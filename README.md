@@ -35,6 +35,7 @@ listener {
     timeout = 30
     on-timeout = pidof -x swaylock && hyprctl "dispatch dpms off"
     on-resume = hyprctl "dispatch dpms on"
+    repeat = true
 }
 
 listener {
@@ -75,6 +76,20 @@ On Sway, run:
 swaymsg -r -t get_tree | jq -r '.. | objects | select(.inhibit_idle == true) | .name'
 ```
 
+### Repeating timers
+
+By default, a listener fires its `on-timeout` command once and then waits for the user to resume. With `repeat = true`, the timer restarts immediately after firing and keeps firing at the same interval for as long as the user remains idle. When the user finally resumes, `on-resume` runs exactly once regardless of how many times the timer fired.
+
+```
+listener {
+    name = nudge
+    timeout = 60
+    on-timeout = notify-send "Still idle..."
+    on-resume = notify-send "Welcome back"
+    repeat = true
+}
+```
+
 ### Hypridle compatibility
 
 *idlers* can be used with an existing hypridle.conf. It adds an optional `name` parameter for `listener` blocks and supports Hypridle's `ignore_inhibit` option. Non-`listener` sections (e.g. Hypridle's `general` block) are silently ignored.
@@ -94,6 +109,7 @@ Mixing `allow-inhibit` and `ignore_inhibit` in the same config is not allowed an
 | `on-timeout` | No | Shell command to run when the timeout fires |
 | `on-resume` | No | Shell command to run when the user becomes active (only if the timeout had fired) |
 | `allow-inhibit` | No | If `true`, respect idle inhibitors (default: `false`) |
+| `repeat` | No | If `true`, the timer restarts immediately after firing and keeps repeating until the user resumes (default: `false`) |
 | `ignore_inhibit` | No | Hypridle-compatible alternative to `allow-inhibit` (see above) |
 
 Non-`listener` sections in the config file are ignored.

@@ -50,8 +50,10 @@ struct Timer {
     on_timeout: String,
     on_resume: String,
     allow_inhibit: bool,
+    repeat: bool,
     started: Instant,
     fired: bool,
+    ever_fired: bool,
     active: bool,
 }
 
@@ -62,6 +64,7 @@ impl Timer {
         on_timeout: &str,
         on_resume: &str,
         allow_inhibit: bool,
+        repeat: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -69,8 +72,10 @@ impl Timer {
             on_timeout: on_timeout.to_string(),
             on_resume: on_resume.to_string(),
             allow_inhibit,
+            repeat,
             started: Instant::now(),
             fired: false,
+            ever_fired: false,
             active: false,
         }
     }
@@ -78,6 +83,7 @@ impl Timer {
     fn reset(&mut self) {
         self.started = Instant::now();
         self.fired = false;
+        self.ever_fired = false;
     }
 
     fn elapsed_secs(&self) -> u64 {
@@ -109,6 +115,7 @@ impl Timers {
         on_timeout: &str,
         on_resume: &str,
         allow_inhibit: bool,
+        repeat: bool,
     ) {
         self.timers.push(Timer::new(
             name,
@@ -116,6 +123,7 @@ impl Timers {
             on_timeout,
             on_resume,
             allow_inhibit,
+            repeat,
         ));
     }
 
@@ -132,8 +140,8 @@ impl Timers {
                 timer.reset();
                 timer.active = true;
             } else if timer.active && !should_be_active {
-                // Becoming inactive: fire on_resume if timer had fired
-                if timer.fired {
+                // Becoming inactive: fire on_resume if timer had fired (at least once)
+                if timer.ever_fired {
                     info!(timer = timer.name, "timer resuming");
                     spawn_shell(&timer.on_resume);
                 }
@@ -146,12 +154,17 @@ impl Timers {
         for timer in &mut self.timers {
             if timer.active && timer.is_expired() && !timer.fired {
                 timer.fired = true;
+                timer.ever_fired = true;
                 info!(
                     timer = timer.name,
                     duration_secs = timer.duration_secs,
                     "timer fired"
                 );
                 spawn_shell(&timer.on_timeout);
+                if timer.repeat {
+                    timer.started = Instant::now();
+                    timer.fired = false;
+                }
             }
         }
     }
@@ -305,6 +318,7 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
         let mut on_resume = String::new();
         let mut allow_inhibit: Option<bool> = None;
         let mut ignore_inhibit: Option<bool> = None;
+        let mut repeat = false;
 
         // Parse key = value lines until '}'
         loop {
@@ -358,6 +372,17 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
                         }
                     });
                 }
+                "repeat" => {
+                    repeat = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(format!(
+                                "line {line}: invalid repeat value: '{value}' (expected true or false)"
+                            ));
+                        }
+                    };
+                }
                 "ignore_inhibit" => {
                     ignore_inhibit = Some(match value.as_str() {
                         "true" => true,
@@ -380,7 +405,7 @@ fn load_config(path: &PathBuf) -> Result<Timers, String> {
         let secs = timeout.ok_or(format!("line {line}: listener block missing 'timeout'"))?;
         let name = name.unwrap_or_else(|| format!("listener-{idx}"));
         // Store raw flags; we resolve the default after parsing all blocks
-        timers.add(&name, secs, &on_timeout, &on_resume, allow_inhibit.unwrap_or(false));
+        timers.add(&name, secs, &on_timeout, &on_resume, allow_inhibit.unwrap_or(false), repeat);
         // Track per-block flags for cross-block validation
         if let Some(v) = allow_inhibit {
             if v {
@@ -436,6 +461,9 @@ fn print_timers(timers: &Timers) {
         }
         if t.allow_inhibit {
             desc.push_str(" allow-inhibit");
+        }
+        if t.repeat {
+            desc.push_str(" repeat");
         }
         info!("{desc}");
     }
